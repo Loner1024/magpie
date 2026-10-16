@@ -93,7 +93,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await gemRow.locator(".res.ok").waitFor();
       const asked = posts.find((p) => p.path === "/api/provider/detect");
       assert.equal(asked.body.base, G, "the URL typed is the base each API is asked at");
-      assert.equal(asked.body.gemini, "", "the Gemini field is the URL typed, so it is asked as Gemini takes it");
+      assert.equal(asked.body.gemini, G, "the Gemini field goes as it stands; the server asks it as Gemini takes it");
       assert.equal(await detect.locator(".detect-out .ep").count(), 4);
       assert.equal(await gemRow.locator(".pl").textContent(), "Gemini");
       for (const width of [900, 440]) {

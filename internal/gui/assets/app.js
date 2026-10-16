@@ -9256,22 +9256,37 @@ function detectAPIs(p, base, use) {
       out.append(e);
     }
   };
+  // one detection's answer at a time stays in the panel: a detection
+  // started after another makes the older one stale, and an older one
+  // that comes back after a newer one is dropped instead of drawn over
+  // its results (merely editing the URL in between does not)
+  let run = 0;
+  // each button's busy mark belongs to its own latest request: the same
+  // button re-entered while asking (the model input's Enter), or go and
+  // each across each other, is not unmarked by the older of the two
+  const busyRun = new Map();
   const ask = async (btn, extra) => {
     const typedBase = (base() || "").trim();
     if (!typedBase && !(draft.chat || draft.responses || draft.anthropic || draft.gemini || "").trim()) { status(t("Type the base URL first"), "warn"); return null; }
+    const n = ++run;
+    busyRun.set(btn, n);
     btn.classList.add("busy");
     out.hidden = false;
     out.replaceChildren(el("span", "hint", t("Asking each API…")));
     try {
-      // the URL typed is asked as each API takes it, not as the field
-      // holding it would send it; URLs given under More endpoints as they are
+      // the URL typed is asked as each API takes it (DetectBase, by the
+      // server), so a saved address the form replaced is asked nowhere;
+      // URLs given under More endpoints go as they are
       const body = { ...asTyped(), id: p?.id, base: typedBase, ...extra };
-      for (const k of ["chat", "responses", "anthropic", "gemini"]) if (body[k] === typedBase) body[k] = "";
       const r = await api("provider/detect", body);
+      if (n !== run) return null;
       out.replaceChildren();
       return r;
-    } catch (e) { out.replaceChildren(); out.hidden = true; status(e.message, "err"); return null; }
-    finally { btn.classList.remove("busy"); }
+    } catch (e) {
+      if (n === run) { out.replaceChildren(); out.hidden = true; status(e.message, "err"); }
+      return null;
+    }
+    finally { if (busyRun.get(btn) === n) { busyRun.delete(btn); btn.classList.remove("busy"); } }
   };
   go.onclick = async () => {
     const m = model.value.trim();

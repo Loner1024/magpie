@@ -521,3 +521,49 @@ func TestDetectGemini(t *testing.T) {
 		t.Fatalf("detecting saved %+v", ps)
 	}
 }
+
+// The base typed is asked as each API takes it (DetectBase): a bare host
+// at …/v1, an endpoint pasted whole (…/chat/completions) cut back to its
+// base. A saved address the form left alone is asked as it is saved, even
+// when it is the base typed — a bare-host Chat URL keeps being asked at
+// /chat/completions, not /v1/chat/completions — which is the spelling the
+// editor's detect keeps for an address the user didn't change (one typed
+// over a saved one the handler respells; see providers.go's detect).
+func TestDetectKeepsASavedAddresssOwnSpelling(t *testing.T) {
+	detectHome(t)
+	srv, got := relay(t)
+	for _, typed := range []string{srv.URL, srv.URL + "/v1/chat/completions"} {
+		before := len(got())
+		if _, err := (Provider{Key: "sk-relay"}).Detect(context.Background(), typed, "gpt-5.5"); err != nil {
+			t.Fatal(err)
+		}
+		var chats []string
+		for _, a := range got()[before:] {
+			if a.method == "POST" && strings.HasSuffix(a.path, "/chat/completions") {
+				chats = append(chats, a.path)
+			}
+		}
+		if len(chats) != 1 || chats[0] != "/v1/chat/completions" {
+			t.Fatalf("%s: chat asked at %v", typed, chats)
+		}
+	}
+	// the saved address, left as it is: asked literally
+	saved, gotSaved := relay(t)
+	before := len(gotSaved())
+	res, err := (Provider{Key: "sk-relay", Chat: saved.URL}).Detect(context.Background(), saved.URL, "gpt-5.5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res[0].Base != saved.URL {
+		t.Fatalf("the saved address is the one asked: %+v", res[0])
+	}
+	var chats []string
+	for _, a := range gotSaved()[before:] {
+		if a.method == "POST" && strings.HasSuffix(a.path, "/chat/completions") {
+			chats = append(chats, a.path)
+		}
+	}
+	if len(chats) != 1 || chats[0] != "/chat/completions" {
+		t.Fatalf("the saved bare host was respelled: %v", chats)
+	}
+}

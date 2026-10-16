@@ -103,7 +103,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.equal(sent.id, "relay");
       assert.equal(sent.base, ROOT + "/v1", "the URL typed");
       assert.equal(sent.model, "m-mixed");
-      assert.equal(sent.chat, "", "the URL typed is asked as each API takes it");
+      assert.equal(sent.chat, ROOT + "/v1", "the URL typed goes as it stands; the server asks it as each API takes it");
       const shown = await ed.locator(".detect-out .ep").evaluateAll((es) => es.map((e) => [e.dataset.api, e.querySelector(".res").className, e.querySelector("code").textContent]));
       assert.deepEqual(shown, [["chat", "res bad", ROOT + "/v1"], ["responses", "res bad", ROOT + "/v1"], ["anthropic", "res ok", ROOT]]);
       assert.equal(await ed.locator('.detect-out .ep[data-api="anthropic"] .res').textContent(), L.ms);
@@ -153,6 +153,182 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         "Its own name, every reasoning level it has, whether it sees images, the API it is asked on, the model it is the same as, and its list price",
       ].filter((k) => !I18N.zh[k]));
       assert.deepEqual(missing, [], "every string has its Chinese");
+      assert.deepEqual(errors, []);
+    });
+  }
+}
+
+// A detection asked while an older one is still out never covers it: the
+// URL typed over the saved one goes in the request as it stands (chat is
+// the new URL, not ""), and the answer of a request sent for a URL since
+// edited — or one that fails — is dropped, leaving the newer results, whose
+// "Use these" applies. The first request is held by its route, released
+// only after the second has been answered and drawn.
+const OTHER = "https://other.example.com";
+
+function serveRace(lang, posts, held) {
+  const state = { agents: [], profiles: [], settings: { lang, theme: "light" } };
+  const models = ["m-1", "m-2"].map((id) => ({ id, name: id, on: true }));
+  const provider = { id: "relay", name: "Relay", icon: "generic", chat: ROOT + "/v1", responses: "", anthropic: "", models, agents: [], fallback: [], headers: {}, key: { set: true, masked: "sk-…1234" }, keyList: [], ready: true };
+  const providers = { providers: [provider], presets: [], excluded: [], gateway: { running: true, window: true } };
+  let seen = 0;
+  return async (route) => {
+    const url = new URL(route.request().url());
+    const json = (data) => route.fulfill({ json: data });
+    if (url.pathname === "/boot.js") return route.fulfill({ contentType: "text/javascript", body: `window.bootPrefs = {lang:${JSON.stringify(lang)},theme:"light",web:true};` });
+    if (url.pathname === "/wails/runtime.js") return route.fulfill({ contentType: "text/javascript", body: "export const Window = {};" });
+    if (url.pathname === "/api/state") return json(state);
+    if (url.pathname === "/api/providers") return json(providers);
+    if (url.pathname === "/api/groups") return json({ groups: [] });
+    if (url.pathname === "/api/provider/detect") {
+      const body = route.request().postDataJSON();
+      posts.push({ path: url.pathname, body });
+      const n = ++seen;
+      if (held && n === (held.which || 1)) {
+        await held.over; // the test releases it once it has the state it checks
+        if (held.fail) return route.abort("connectionreset");
+      }
+      const root = (body.base || "").replace(/\/v1$/, "");
+      const rows = (m) => [
+        { protocol: "chat", ok: true, ms: 21, model: m, base: root + "/v1" },
+        { protocol: "responses", ok: false, status: 404, error: "Invalid URL", model: m, base: root + "/v1" },
+        { protocol: "anthropic", ok: true, ms: 22, model: m, base: root },
+      ];
+      if (body.detectModels) {
+        const models = body.detectModels.map((m) => ({ model: m, results: rows(m) }));
+        return json({ results: models[0].results, models });
+      }
+      return json({ results: rows(body.model || "m-1") });
+    }
+    if (url.pathname.startsWith("/api/provider/")) {
+      posts.push({ path: url.pathname, body: route.request().postDataJSON() });
+      return json(providers);
+    }
+    if (url.pathname.startsWith("/api/")) return json({});
+    const file = path.join(assets, url.pathname === "/" ? "index.html" : url.pathname);
+    await route.fulfill({ body: await fs.readFile(file), contentType: { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".png": "image/png" }[path.extname(file)] });
+  };
+}
+
+for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
+  for (const lang of ["en", "zh"]) {
+    for (const [what, failStale] of [["go then each", false], ["each then go", false], ["a stale failure", true]]) {
+      test(`${engine} ${lang}: a stale detection, ${what}, leaves the newer one`, async (t) => {
+        const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: process.env.PLAYWRIGHT_CHANNEL || "chromium" }));
+        const page = await (await browser.newContext({ viewport: { width: 900, height: 760 }, reducedMotion: "reduce" })).newPage();
+        t.after(async () => {
+          if (process.env.ARTIFACT_DIR) {
+            await fs.mkdir(process.env.ARTIFACT_DIR, { recursive: true });
+            await page.screenshot({ path: path.join(process.env.ARTIFACT_DIR, `${engine}-${lang}-provider-detect-stale.png`), fullPage: true });
+          }
+          await browser.close();
+        });
+        page.setDefaultTimeout(5000);
+        const errors = [], posts = [];
+        page.on("pageerror", (e) => errors.push(e.message));
+        const zh = lang === "zh";
+        const L = {
+          detect: zh ? "检测协议" : "Detect APIs", each: zh ? "逐个检测已选模型" : "Each picked model",
+          use: zh ? "使用检测结果" : "Use these", taken: zh ? "已填入 · 保存后生效" : "Taken · save to keep",
+        };
+        const held = { over: null, fail: false };
+        await page.route("**/*", serveRace(lang, posts, held));
+        await page.goto("http://magpie.test/?view=providers");
+        await page.locator(".row.provider").click();
+        const ed = page.locator(".editor");
+        await ed.locator(".detect").waitFor();
+        await ed.locator(".detect-model").fill("m-1");
+        const go = () => ed.getByRole("button", { name: L.detect, exact: true }).click();
+        const each = () => ed.getByRole("button", { name: L.each, exact: true }).click();
+        // the first request, sent for the URL saved, is held by the route
+        let release;
+        held.over = new Promise((res) => { release = res; });
+        await (what === "each then go" ? each() : go());
+        for (let i = 0; i < 40 && posts.length < 1; i++) await page.waitForTimeout(25);
+        assert.equal(posts.length, 1);
+        assert.equal(posts[0].body.chat, ROOT + "/v1", "the URL as it stands goes in the request");
+        assert.equal(posts[0].body.base, ROOT + "/v1");
+        await ed.locator("input.base-url").fill(OTHER + "/v1");
+        // the second, for the URL typed over it: the other button, or the
+        // same one again by the model input's Enter (.busy takes the
+        // button's pointer events)
+        if (what === "a stale failure") await ed.locator(".detect-model").press("Enter");
+        else if (what === "each then go") await go();
+        else await each();
+        for (let i = 0; i < 40 && posts.length < 2; i++) await page.waitForTimeout(25);
+        assert.equal(posts.length, 2);
+        assert.equal(posts[1].body.base, OTHER + "/v1");
+        assert.equal(posts[1].body.chat, OTHER + "/v1", "the URL typed is sent, not cleared to ask the saved one");
+        await ed.locator('.detect-out .ep[data-api="anthropic"]').waitFor();
+        const rows = () => ed.locator(".detect-out .ep").evaluateAll((es) => es.map((e) => [e.dataset.api, e.querySelector("code").textContent]));
+        assert.deepEqual(await rows(), [["chat", OTHER + "/v1"], ["responses", OTHER + "/v1"], ["anthropic", OTHER]], "the newer results are drawn");
+        const statusBefore = await page.locator("#status").textContent();
+        assert.equal(await ed.locator(".detect-out .hint").count(), 0, "no placeholder over them");
+        // the stale answer comes back after the newer one: drawn over
+        // nothing, and a stale failure says nothing and hides nothing
+        held.fail = failStale;
+        release();
+        await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+        await page.waitForTimeout(300);
+        assert.deepEqual(await rows(), [["chat", OTHER + "/v1"], ["responses", OTHER + "/v1"], ["anthropic", OTHER]], "the stale answer did not cover the newer one");
+        assert.equal(await ed.locator(".detect-out .hint").count(), 0);
+        assert.equal(await ed.locator(".detect-row .busy").count(), 0, "neither button is left busy");
+        assert.equal(await page.locator("#status").textContent(), statusBefore, "a stale answer says nothing");
+        // "Use these" is the newer results': the URLs taken are the URL typed
+        await ed.getByRole("button", { name: L.use, exact: true }).click();
+        assert.equal(await ed.getByRole("button", { name: L.taken, exact: true }).count(), 1);
+        const values = await ed.locator("input").evaluateAll((is) => is.map((i) => i.value));
+        assert(values.includes(OTHER + "/v1"), "the typed URL is taken: " + values);
+        assert(values.includes(OTHER), "as each API takes it: " + values);
+        assert(!values.includes(ROOT + "/v1"), "the URL the form replaced is not taken: " + values);
+        assert.deepEqual(errors, []);
+      });
+    }
+
+    // the other order: an older detection answers while the newer one is
+    // still out (the same button asked again from the model input's Enter,
+    // its second request held by the route) — the older one is dropped, the
+    // placeholder and the button's busy mark stay for the newer one, and
+    // only its answer is drawn
+    test(`${engine} ${lang}: an older detection answering first leaves the newer one asking`, async (t) => {
+      const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: process.env.PLAYWRIGHT_CHANNEL || "chromium" }));
+      const page = await (await browser.newContext({ viewport: { width: 900, height: 760 }, reducedMotion: "reduce" })).newPage();
+      t.after(async () => { await browser.close(); });
+      page.setDefaultTimeout(5000);
+      const errors = [], posts = [];
+      page.on("pageerror", (e) => errors.push(e.message));
+      const zh = lang === "zh";
+      const L = { detect: zh ? "检测协议" : "Detect APIs" };
+      const held = { over: null, which: 2 };
+      let release;
+      held.over = new Promise((res) => { release = res; });
+      await page.route("**/*", serveRace(lang, posts, held));
+      await page.goto("http://magpie.test/?view=providers");
+      await page.locator(".row.provider").click();
+      const ed = page.locator(".editor");
+      await ed.locator(".detect").waitFor();
+      await ed.locator(".detect-model").fill("m-1");
+      await ed.getByRole("button", { name: L.detect, exact: true }).click();
+      for (let i = 0; i < 40 && posts.length < 1; i++) await page.waitForTimeout(25);
+      assert.equal(posts.length, 1);
+      // the same button again, for the URL typed over the saved one
+      await ed.locator("input.base-url").fill(OTHER + "/v1");
+      await ed.locator(".detect-model").press("Enter");
+      for (let i = 0; i < 40 && posts.length < 2; i++) await page.waitForTimeout(25);
+      assert.equal(posts.length, 2);
+      assert.equal(posts[1].body.base, OTHER + "/v1");
+      assert.equal(posts[1].body.chat, OTHER + "/v1", "the URL typed is sent, not cleared to ask the saved one");
+      await page.waitForTimeout(300);
+      // the first answer has had its turn: the newer one is still asking
+      assert.equal(await ed.locator(".detect-out .hint").count(), 1, "the newer request's placeholder is up");
+      assert.equal(await ed.locator(".detect-out .ep").count(), 0, "the older answer was not drawn");
+      assert.equal(await ed.locator(".detect-row .busy").count(), 1, "the newer request keeps the button busy");
+      release();
+      await ed.locator('.detect-out .ep[data-api="anthropic"]').waitFor();
+      const rows = () => ed.locator(".detect-out .ep").evaluateAll((es) => es.map((e) => [e.dataset.api, e.querySelector("code").textContent]));
+      assert.deepEqual(await rows(), [["chat", OTHER + "/v1"], ["responses", OTHER + "/v1"], ["anthropic", OTHER]], "the newer answer is drawn");
+      assert.equal(await ed.locator(".detect-out .hint").count(), 0, "no placeholder over them");
+      assert.equal(await ed.locator(".detect-row .busy").count(), 0, "the button is not left busy");
       assert.deepEqual(errors, []);
     });
   }
