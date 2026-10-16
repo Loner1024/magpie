@@ -1774,7 +1774,14 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 			// or a saved one's with its key when none is typed — a copy
 			// not saved yet with the key of the one it copies (CopyOf),
 			// as its Add takes it. Nothing is written: the provider is
-			// only asked, never kept, listed or routed to (#1545).
+			// only asked, never kept, listed or routed to (#1545). An
+			// address the form holds that equals the base URL typed and
+			// differs from the saved one is a URL typed over a saved one:
+			// it is asked as the base takes it (DetectBase), so the saved
+			// address the form replaced is asked nowhere. One the form
+			// left alone keeps its own spelling — a bare-host Chat URL
+			// stays asked at /chat/completions, not /v1/chat/completions —
+			// as do More endpoints' addresses.
 			var p provider.Provider
 			from := in.ID
 			if from == "" && req.New {
@@ -1787,6 +1794,29 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 					return
 				}
 				p = *saved
+			}
+			if base := strings.TrimSpace(req.Base); base != "" {
+				for _, f := range [...]struct {
+					form, saved *string
+					proto       provider.Protocol
+				}{
+					{&in.Chat, &p.Chat, provider.Chat},
+					{&in.Responses, &p.Responses, provider.Responses},
+					{&in.Anthropic, &p.Anthropic, provider.Anthropic},
+					{&in.Gemini, &p.Gemini, provider.Gemini},
+				} {
+					if v := strings.TrimSpace(*f.form); v != "" && v == base && v != strings.TrimSpace(*f.saved) {
+						// a base DetectBase cannot spell (a path
+						// alone, "/") keeps the form's own word,
+						// which detecting's URL check refuses:
+						// typed() takes an empty field for
+						// "unchanged" and falls back to the saved
+						// address the form replaced
+						if db := provider.DetectBase(base, f.proto); db != "" {
+							*f.form = db
+						}
+					}
+				}
 			}
 			p = typed(p, in, req.Proxy, req.InsecureTLS)
 			if strings.TrimSpace(in.Decide) != "" {
